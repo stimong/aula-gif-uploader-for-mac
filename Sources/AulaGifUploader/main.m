@@ -2,6 +2,8 @@
 #import <ImageIO/ImageIO.h>
 #import <UniformTypeIdentifiers/UniformTypeIdentifiers.h>
 
+static const NSUInteger MaxInputFiles = 10;
+
 @interface KeyboardPreset : NSObject
 @property(nonatomic, copy) NSString *name;
 @property(nonatomic) NSUInteger width;
@@ -40,7 +42,7 @@ static NSArray<KeyboardPreset *> *KeyboardPresets(void) {
     static dispatch_once_t onceToken;
     dispatch_once(&onceToken, ^{
         presets = @[
-            Preset(@"AULA F108Pro", 240, 135, 32),
+            Preset(@"AULA F108Pro", 240, 135, 140),
             Preset(@"AULA F75 Max", 128, 128, 120)
         ];
     });
@@ -92,7 +94,7 @@ static ImageInfo *InspectImage(NSURL *url) {
 }
 
 @interface DropView : NSView
-@property(nonatomic, copy) void (^fileHandler)(NSURL *url);
+@property(nonatomic, copy) void (^filesHandler)(NSArray<NSURL *> *urls);
 @end
 
 @implementation DropView
@@ -117,9 +119,10 @@ static ImageInfo *InspectImage(NSURL *url) {
 }
 - (BOOL)performDragOperation:(id<NSDraggingInfo>)sender {
     self.layer.borderColor = [NSColor separatorColor].CGColor;
-    NSURL *url = [NSURL URLFromPasteboard:sender.draggingPasteboard];
-    if (url && self.fileHandler) {
-        self.fileHandler(url);
+    NSArray<NSURL *> *urls = [sender.draggingPasteboard readObjectsForClasses:@[NSURL.class]
+                                                                       options:@{NSPasteboardURLReadingFileURLsOnlyKey: @YES}];
+    if (urls.count > 0 && self.filesHandler) {
+        self.filesHandler(urls);
         return YES;
     }
     return NO;
@@ -135,12 +138,15 @@ static ImageInfo *InspectImage(NSURL *url) {
 @property(nonatomic, strong) NSTextField *targetLabel;
 @property(nonatomic, strong) NSTextField *titleLabel;
 @property(nonatomic, strong) NSTextField *detailsLabel;
+@property(nonatomic, strong) NSTextField *resizeNoticeLabel;
 @property(nonatomic, strong) NSTextField *statusLabel;
 @property(nonatomic, strong) NSButton *chooseButton;
 @property(nonatomic, strong) NSButton *uploadButton;
 @property(nonatomic, strong) NSProgressIndicator *progress;
-@property(nonatomic, strong) ImageInfo *selectedInfo;
+@property(nonatomic, strong) NSArray<ImageInfo *> *selectedInfos;
+@property(nonatomic) BOOL selectionWasCapped;
 @property(nonatomic, strong) NSTask *uploadTask;
+@property(nonatomic, strong) NSURL *temporaryUploadURL;
 @end
 
 @implementation AppDelegate
@@ -190,22 +196,25 @@ static ImageInfo *InspectImage(NSURL *url) {
 
     DropView *drop = [[DropView alloc] initWithFrame:NSMakeRect(24, 126, 472, 166)];
     __weak typeof(self) weakSelf = self;
-    drop.fileHandler = ^(NSURL *url) {
-        [weakSelf selectURL:url];
+    drop.filesHandler = ^(NSArray<NSURL *> *urls) {
+        [weakSelf selectURLs:urls];
     };
     [content addSubview:drop];
 
-    self.titleLabel = [self label:@"Drop image/GIF here" frame:NSMakeRect(48, 222, 424, 26) size:18 weight:NSFontWeightSemibold color:NSColor.labelColor alignment:NSTextAlignmentCenter];
+    self.titleLabel = [self label:@"Drag & drop images/GIFs here" frame:NSMakeRect(48, 222, 424, 26) size:18 weight:NSFontWeightSemibold color:NSColor.labelColor alignment:NSTextAlignmentCenter];
     [content addSubview:self.titleLabel];
 
-    self.detailsLabel = [self label:@"Choose a keyboard model, then upload an image or GIF." frame:NSMakeRect(48, 176, 424, 42) size:13 weight:NSFontWeightRegular color:NSColor.secondaryLabelColor alignment:NSTextAlignmentCenter];
+    self.detailsLabel = [self label:@"Drop up to 10 files here or choose them from Finder." frame:NSMakeRect(48, 176, 424, 42) size:13 weight:NSFontWeightRegular color:NSColor.secondaryLabelColor alignment:NSTextAlignmentCenter];
     self.detailsLabel.maximumNumberOfLines = 2;
     [content addSubview:self.detailsLabel];
 
-    self.chooseButton = [NSButton buttonWithTitle:@"Choose Image/GIF" target:self action:@selector(chooseFile:)];
+    self.chooseButton = [NSButton buttonWithTitle:@"Choose Images/GIFs" target:self action:@selector(chooseFile:)];
     self.chooseButton.frame = NSMakeRect(176, 138, 168, 30);
     self.chooseButton.bezelStyle = NSBezelStyleRounded;
     [content addSubview:self.chooseButton];
+
+    self.resizeNoticeLabel = [self label:@"Images that do not match the target size are resized before upload." frame:NSMakeRect(24, 104, 472, 18) size:12 weight:NSFontWeightRegular color:NSColor.secondaryLabelColor alignment:NSTextAlignmentCenter];
+    [content addSubview:self.resizeNoticeLabel];
 
     self.statusLabel = [self label:@"Connect the AULA keyboard in wired USB mode before uploading." frame:NSMakeRect(24, 86, 472, 18) size:12 weight:NSFontWeightRegular color:NSColor.secondaryLabelColor alignment:NSTextAlignmentCenter];
     [content addSubview:self.statusLabel];
@@ -291,6 +300,34 @@ static ImageInfo *InspectImage(NSURL *url) {
     return value > 255 ? 255 : value;
 }
 
+- (BOOL)hasReadableSelection {
+    if (self.selectedInfos.count == 0) {
+        return NO;
+    }
+    for (ImageInfo *info in self.selectedInfos) {
+        if (!info.readable) {
+            return NO;
+        }
+    }
+    return YES;
+}
+
+- (NSUInteger)selectedFrameCount {
+    NSUInteger total = 0;
+    for (ImageInfo *info in self.selectedInfos) {
+        total += MAX(info.frames, 1);
+    }
+    return total;
+}
+
+- (unsigned long long)selectedByteCount {
+    unsigned long long total = 0;
+    for (ImageInfo *info in self.selectedInfos) {
+        total += info.bytes;
+    }
+    return total;
+}
+
 - (void)refreshValidation {
     KeyboardPreset *preset = self.selectedPreset;
     NSUInteger width = self.targetWidth;
@@ -312,31 +349,59 @@ static ImageInfo *InspectImage(NSURL *url) {
     if (!validTarget) {
         self.statusLabel.textColor = NSColor.systemRedColor;
         self.statusLabel.stringValue = @"Width, height, and frame limit must be positive numbers.";
+        self.resizeNoticeLabel.textColor = NSColor.secondaryLabelColor;
+        self.resizeNoticeLabel.stringValue = @"Images that do not match the target size are resized before upload.";
         self.uploadButton.enabled = NO;
         return;
     }
 
-    if (!self.selectedInfo) {
+    if (self.selectedInfos.count == 0) {
         self.statusLabel.textColor = NSColor.secondaryLabelColor;
         self.statusLabel.stringValue = @"Connect the AULA keyboard in wired USB mode before uploading.";
+        self.resizeNoticeLabel.textColor = NSColor.secondaryLabelColor;
+        self.resizeNoticeLabel.stringValue = @"Images that do not match the target size are resized before upload.";
         self.uploadButton.enabled = NO;
         return;
     }
 
-    if (!self.selectedInfo.readable) {
-        self.statusLabel.textColor = NSColor.systemRedColor;
-        self.statusLabel.stringValue = self.selectedInfo.status ?: @"Unsupported image file.";
-        self.uploadButton.enabled = NO;
-        return;
+    for (ImageInfo *info in self.selectedInfos) {
+        if (!info.readable) {
+            self.statusLabel.textColor = NSColor.systemRedColor;
+            self.statusLabel.stringValue = info.status ?: @"Unsupported image file.";
+            self.resizeNoticeLabel.textColor = NSColor.systemRedColor;
+            self.resizeNoticeLabel.stringValue = @"Cannot inspect one of the selected files for resizing.";
+            self.uploadButton.enabled = NO;
+            return;
+        }
     }
 
-    NSUInteger sentFrames = MIN(self.selectedInfo.frames, frameLimit);
-    BOOL willResize = self.selectedInfo.width != width || self.selectedInfo.height != height;
-    BOOL willTrim = self.selectedInfo.frames > frameLimit;
+    NSUInteger sourceFrames = self.selectedFrameCount;
+    NSUInteger sentFrames = MIN(sourceFrames, frameLimit);
+    BOOL multipleFiles = self.selectedInfos.count > 1;
+    ImageInfo *firstInfo = self.selectedInfos.firstObject;
+    BOOL willResize = multipleFiles || firstInfo.width != width || firstInfo.height != height;
+    BOOL willTrim = sourceFrames > frameLimit;
 
     NSMutableArray<NSString *> *notes = [NSMutableArray array];
-    [notes addObject:willResize ? [NSString stringWithFormat:@"will fit to %lu x %lu", (unsigned long)width, (unsigned long)height] : @"size matches target"];
-    [notes addObject:willTrim ? [NSString stringWithFormat:@"will trim %lu to %lu frames", (unsigned long)self.selectedInfo.frames, (unsigned long)sentFrames] : [NSString stringWithFormat:@"will send %lu frame%@", (unsigned long)sentFrames, sentFrames == 1 ? @"" : @"s"]];
+    if (self.selectionWasCapped) {
+        [notes addObject:[NSString stringWithFormat:@"using first %lu files", (unsigned long)MaxInputFiles]];
+    }
+    [notes addObject:multipleFiles ? [NSString stringWithFormat:@"will merge %lu files", (unsigned long)self.selectedInfos.count] : (willResize ? [NSString stringWithFormat:@"will resize to %lu x %lu", (unsigned long)width, (unsigned long)height] : @"size matches target")];
+    [notes addObject:willTrim ? [NSString stringWithFormat:@"will trim %lu to %lu frames", (unsigned long)sourceFrames, (unsigned long)sentFrames] : [NSString stringWithFormat:@"will send %lu frame%@", (unsigned long)sentFrames, sentFrames == 1 ? @"" : @"s"]];
+
+    self.resizeNoticeLabel.textColor = willResize ? NSColor.systemOrangeColor : NSColor.secondaryLabelColor;
+    if (multipleFiles) {
+        self.resizeNoticeLabel.stringValue = [NSString stringWithFormat:@"Merge required: selected files will become one GIF fitted into %lu x %lu.", (unsigned long)width, (unsigned long)height];
+    } else if (willResize) {
+        self.resizeNoticeLabel.stringValue = [NSString stringWithFormat:@"Resize required: %lu x %lu will be fitted into %lu x %lu before upload.",
+            (unsigned long)firstInfo.width,
+            (unsigned long)firstInfo.height,
+            (unsigned long)width,
+            (unsigned long)height
+        ];
+    } else {
+        self.resizeNoticeLabel.stringValue = [NSString stringWithFormat:@"No resize needed: source already matches %lu x %lu.", (unsigned long)width, (unsigned long)height];
+    }
 
     self.statusLabel.textColor = NSColor.secondaryLabelColor;
     self.statusLabel.stringValue = [NSString stringWithFormat:@"Ready: %@.", [notes componentsJoinedByString:@", "]];
@@ -347,27 +412,42 @@ static ImageInfo *InspectImage(NSURL *url) {
     NSOpenPanel *panel = [NSOpenPanel openPanel];
     panel.canChooseFiles = YES;
     panel.canChooseDirectories = NO;
-    panel.allowsMultipleSelection = NO;
+    panel.allowsMultipleSelection = YES;
     panel.allowedContentTypes = @[UTTypeGIF, UTTypePNG, UTTypeJPEG, UTTypeImage];
     if ([panel runModal] == NSModalResponseOK) {
-        [self selectURL:panel.URL];
+        [self selectURLs:panel.URLs];
     }
 }
 
-- (void)selectURL:(NSURL *)url {
-    ImageInfo *info = InspectImage(url);
-    self.selectedInfo = info;
+- (void)selectURLs:(NSArray<NSURL *> *)urls {
+    NSUInteger count = MIN(urls.count, MaxInputFiles);
+    self.selectionWasCapped = urls.count > MaxInputFiles;
+    NSMutableArray<ImageInfo *> *infos = [NSMutableArray arrayWithCapacity:count];
+    for (NSUInteger index = 0; index < count; index++) {
+        [infos addObject:InspectImage(urls[index])];
+    }
+    self.selectedInfos = infos;
     self.progress.doubleValue = 0;
 
-    NSString *name = url.lastPathComponent ?: @"Selected file";
-    self.titleLabel.stringValue = name;
-    self.detailsLabel.stringValue = [NSString stringWithFormat:@"%lu x %lu | %lu frame%@ | %@",
-        (unsigned long)info.width,
-        (unsigned long)info.height,
-        (unsigned long)info.frames,
-        info.frames == 1 ? @"" : @"s",
-        HumanSize(info.bytes)
-    ];
+    if (infos.count == 1) {
+        ImageInfo *info = infos.firstObject;
+        NSURL *url = urls.firstObject;
+        self.titleLabel.stringValue = url.lastPathComponent ?: @"Selected file";
+        self.detailsLabel.stringValue = [NSString stringWithFormat:@"%lu x %lu | %lu frame%@ | %@",
+            (unsigned long)info.width,
+            (unsigned long)info.height,
+            (unsigned long)info.frames,
+            info.frames == 1 ? @"" : @"s",
+            HumanSize(info.bytes)
+        ];
+    } else {
+        NSUInteger frames = self.selectedFrameCount;
+        self.titleLabel.stringValue = [NSString stringWithFormat:@"%lu files selected", (unsigned long)infos.count];
+        self.detailsLabel.stringValue = [NSString stringWithFormat:@"Will merge into one GIF | %lu total frames | %@",
+            (unsigned long)frames,
+            HumanSize(self.selectedByteCount)
+        ];
+    }
     [self refreshValidation];
 }
 
@@ -377,15 +457,92 @@ static ImageInfo *InspectImage(NSURL *url) {
     self.heightField.enabled = !busy;
     self.frameLimitField.enabled = !busy;
     self.chooseButton.enabled = !busy;
-    self.uploadButton.enabled = !busy && self.selectedInfo.readable && self.targetWidth > 0 && self.targetHeight > 0 && self.frameLimit > 0;
+    self.uploadButton.enabled = !busy && self.hasReadableSelection && self.targetWidth > 0 && self.targetHeight > 0 && self.frameLimit > 0;
 }
 
 - (NSURL *)probeURL {
     return [[[NSBundle mainBundle] executableURL].URLByDeletingLastPathComponent URLByAppendingPathComponent:@"F75Probe"];
 }
 
+- (NSDictionary *)gifFramePropertiesForSource:(CGImageSourceRef)source index:(size_t)index {
+    NSDictionary *properties = CFBridgingRelease(CGImageSourceCopyPropertiesAtIndex(source, index, NULL));
+    NSDictionary *gif = properties[(NSString *)kCGImagePropertyGIFDictionary];
+    NSNumber *delay = gif[(NSString *)kCGImagePropertyGIFUnclampedDelayTime] ?: gif[(NSString *)kCGImagePropertyGIFDelayTime];
+    double seconds = delay.doubleValue > 0.0 ? delay.doubleValue : 0.12;
+    return @{
+        (NSString *)kCGImagePropertyGIFDictionary: @{
+            (NSString *)kCGImagePropertyGIFDelayTime: @(seconds)
+        }
+    };
+}
+
+- (NSURL *)mergedGIFURLWithFrameLimit:(NSUInteger)frameLimit error:(NSError **)error {
+    NSUInteger totalFrames = MIN(self.selectedFrameCount, frameLimit);
+    if (totalFrames == 0) {
+        if (error) {
+            *error = [NSError errorWithDomain:@"AulaGifUploader" code:1 userInfo:@{NSLocalizedDescriptionKey: @"No frames to merge."}];
+        }
+        return nil;
+    }
+
+    NSString *fileName = [NSString stringWithFormat:@"AulaGifUploader-%@.gif", NSUUID.UUID.UUIDString];
+    NSURL *url = [NSURL fileURLWithPath:[NSTemporaryDirectory() stringByAppendingPathComponent:fileName]];
+    CGImageDestinationRef destination = CGImageDestinationCreateWithURL((__bridge CFURLRef)url, (__bridge CFStringRef)UTTypeGIF.identifier, totalFrames, NULL);
+    if (!destination) {
+        if (error) {
+            *error = [NSError errorWithDomain:@"AulaGifUploader" code:2 userInfo:@{NSLocalizedDescriptionKey: @"Could not create merged GIF."}];
+        }
+        return nil;
+    }
+
+    NSDictionary *gifProperties = @{
+        (NSString *)kCGImagePropertyGIFDictionary: @{
+            (NSString *)kCGImagePropertyGIFLoopCount: @0
+        }
+    };
+    CGImageDestinationSetProperties(destination, (__bridge CFDictionaryRef)gifProperties);
+
+    NSUInteger written = 0;
+    for (ImageInfo *info in self.selectedInfos) {
+        if (written >= totalFrames) {
+            break;
+        }
+        NSURL *sourceURL = [NSURL fileURLWithPath:info.path];
+        CGImageSourceRef source = CGImageSourceCreateWithURL((__bridge CFURLRef)sourceURL, NULL);
+        if (!source) {
+            continue;
+        }
+
+        size_t count = MAX(CGImageSourceGetCount(source), 1);
+        for (size_t index = 0; index < count && written < totalFrames; index++) {
+            CGImageRef image = CGImageSourceCreateImageAtIndex(source, index, NULL);
+            if (!image) {
+                continue;
+            }
+            NSDictionary *frameProperties = [self gifFramePropertiesForSource:source index:index];
+            CGImageDestinationAddImage(destination, image, (__bridge CFDictionaryRef)frameProperties);
+            CGImageRelease(image);
+            written++;
+        }
+        CFRelease(source);
+    }
+
+    BOOL finalized = CGImageDestinationFinalize(destination);
+    CFRelease(destination);
+
+    if (!finalized || written == 0) {
+        [[NSFileManager defaultManager] removeItemAtURL:url error:nil];
+        if (error) {
+            *error = [NSError errorWithDomain:@"AulaGifUploader" code:3 userInfo:@{NSLocalizedDescriptionKey: @"Could not finalize merged GIF."}];
+        }
+        return nil;
+    }
+
+    return url;
+}
+
 - (void)upload:(id)sender {
-    if (!self.selectedInfo.readable || self.targetWidth == 0 || self.targetHeight == 0 || self.frameLimit == 0) {
+    if (!self.hasReadableSelection || self.targetWidth == 0 || self.targetHeight == 0 || self.frameLimit == 0) {
         return;
     }
 
@@ -395,9 +552,21 @@ static ImageInfo *InspectImage(NSURL *url) {
         return;
     }
 
+    self.temporaryUploadURL = nil;
+    NSURL *uploadURL = [NSURL fileURLWithPath:self.selectedInfos.firstObject.path];
+    if (self.selectedInfos.count > 1) {
+        NSError *mergeError = nil;
+        uploadURL = [self mergedGIFURLWithFrameLimit:self.frameLimit error:&mergeError];
+        if (!uploadURL) {
+            [self fail:mergeError.localizedDescription ?: @"Could not merge selected files."];
+            return;
+        }
+        self.temporaryUploadURL = uploadURL;
+    }
+
     self.progress.doubleValue = 1;
     self.statusLabel.textColor = NSColor.secondaryLabelColor;
-    self.statusLabel.stringValue = @"Uploading...";
+    self.statusLabel.stringValue = self.selectedInfos.count > 1 ? @"Merging complete. Uploading..." : @"Uploading...";
     [self setBusy:YES];
 
     NSTask *task = [[NSTask alloc] init];
@@ -405,7 +574,7 @@ static ImageInfo *InspectImage(NSURL *url) {
     task.currentDirectoryURL = probe.URLByDeletingLastPathComponent;
     task.arguments = @[
         @"--wired",
-        @"--screen-upload-image", self.selectedInfo.path,
+        @"--screen-upload-image", uploadURL.path,
         @"--screen-width", [NSString stringWithFormat:@"%lu", (unsigned long)self.targetWidth],
         @"--screen-height", [NSString stringWithFormat:@"%lu", (unsigned long)self.targetHeight],
         @"--screen-max-frames", [NSString stringWithFormat:@"%lu", (unsigned long)self.frameLimit],
@@ -438,6 +607,10 @@ static ImageInfo *InspectImage(NSURL *url) {
         dispatch_async(dispatch_get_main_queue(), ^{
             [weakSelf setBusy:NO];
             weakSelf.uploadTask = nil;
+            if (weakSelf.temporaryUploadURL) {
+                [[NSFileManager defaultManager] removeItemAtURL:weakSelf.temporaryUploadURL error:nil];
+                weakSelf.temporaryUploadURL = nil;
+            }
             if (finishedTask.terminationStatus == 0) {
                 weakSelf.progress.doubleValue = 100;
                 weakSelf.statusLabel.textColor = NSColor.systemGreenColor;
@@ -452,6 +625,10 @@ static ImageInfo *InspectImage(NSURL *url) {
     NSError *error = nil;
     if (![task launchAndReturnError:&error]) {
         [self setBusy:NO];
+        if (self.temporaryUploadURL) {
+            [[NSFileManager defaultManager] removeItemAtURL:self.temporaryUploadURL error:nil];
+            self.temporaryUploadURL = nil;
+        }
         [self fail:error.localizedDescription ?: @"Could not start upload helper."];
     }
 }
